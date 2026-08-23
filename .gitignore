@@ -1,0 +1,15 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Transient test and runtime directories
+.specs/
+.sync/
+.worktrees/
+.tmp/
+*.tmp
+
+# OS generated files
+.DS_Store
+Thumbs.db

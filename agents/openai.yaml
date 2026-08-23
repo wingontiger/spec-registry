@@ -1,0 +1,3 @@
+display_name: SPEC Registry
+short_description: Track and coordinate SPECs across parallel Codex tasks
+default_prompt: Initialize the shared SPEC registry for this repository and show active impact-scope conflicts.
