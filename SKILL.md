@@ -20,13 +20,14 @@ When Git worktrees are used, group related SPECs under one `epic_id` and reuse o
 ## Required Workflow
 
 1. At task start, read `.specs/registry.json` if present. Regenerate it first when it is stale, missing, or disagrees with `SPEC-*.md`.
-2. Before issuing a new SPEC, compare intended modules, files, API endpoints, and database entities with active specs using the conflict checker.
-3. Create every new SPEC through the CLI so IDs remain sequential and frontmatter follows the schema.
-4. Update status as work progresses (`Draft`, `In-Progress`, `Completed`, `Deprecated`) and refresh generated artifacts after every lifecycle change.
-5. When implementation needs physical isolation, run `attach --spec <id>` instead of creating branches or worktrees manually. Edit only inside the returned `.worktrees/epic-<epic_id>` directory.
-6. During development, run `check-scope` for nonblocking warnings when files fall outside `impact_scope`. Update the SPEC before continuing if the change is intentional.
-7. Before final delivery, refresh the registry and run the conflict check against actual changed paths. Resolve real overlaps through dependencies, a revised SPEC, or an explicit note explaining why coexistence is safe.
-8. After review passes and every SPEC assigned to an Epic is merged and marked Completed or Deprecated, run `finish --epic <id>` with the correct base branch to remove the worktree. Never delete `.specs/` history.
+2. Check for relay handoffs: run `heartbeats` to read `.sync/MERGED_STATE.md`. If a `mode: relay` heartbeat exists for a SPEC in your scope, run `attach --spec <id>` before making any changes to reuse the same worktree. Then publish your own heartbeat with `--mode concurrent` to signal you have taken over.
+3. Before issuing a new SPEC, compare intended modules, files, API endpoints, and database entities with active specs using the conflict checker.
+4. Create every new SPEC through the CLI so IDs remain sequential and frontmatter follows the schema.
+5. Update status as work progresses (`Draft`, `In-Progress`, `Completed`, `Deprecated`) and refresh generated artifacts after every lifecycle change.
+6. When implementation needs physical isolation, run `attach --spec <id>` instead of creating branches or worktrees manually. Edit only inside the returned `.worktrees/epic-<epic_id>` directory.
+7. During development, run `check-scope` for nonblocking warnings when files fall outside `impact_scope`. Note that `check-scope` validates physical files/modules against git diff; it does not detect API contract or database entity drift — use `check` for that (semantic four-dimension conflict detection).
+8. Before final delivery, refresh the registry and run the conflict check against actual changed paths. Resolve real overlaps through dependencies, a revised SPEC, or an explicit note explaining why coexistence is safe.
+9. After review passes and every SPEC assigned to an Epic is merged and marked Completed or Deprecated, run `finish --epic <id>` with the correct base branch to remove the worktree. Never delete `.specs/` history.
 
 Run the bundled tool from the target repository root:
 

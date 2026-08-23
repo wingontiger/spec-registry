@@ -256,6 +256,18 @@ def scan_specs() -> list[dict[str, Any]]:
         if unknown:
             raise RegistryError(f"{spec['source_path']}: unknown referenced SPEC IDs: {', '.join(unknown)}")
 
+    # Warn about asymmetric blocks declarations (not a hard error).
+    spec_by_id = {spec["id"]: spec for spec in specs}
+    for spec in specs:
+        for blocked_id in spec["blocks"]:
+            blocked_spec = spec_by_id.get(blocked_id)
+            if blocked_spec and spec["id"] not in blocked_spec.get("depends_on", []):
+                print(
+                    f"warning: {blocked_id} does not list {spec['id']} in depends_on "
+                    f"but is declared as blocked by it",
+                    file=sys.stderr,
+                )
+
     graph = {spec["id"]: set(spec["depends_on"]) for spec in specs}
     state: dict[str, int] = {}
 
@@ -337,7 +349,10 @@ def next_spec_id(specs: list[dict[str, Any]]) -> str:
 
 
 def normalize_relative(value: str) -> str:
-    return value.replace("\\", "/").lstrip("./").rstrip("/")
+    val = value.replace("\\", "/")
+    if val.startswith("./"):
+        val = val[2:]
+    return val.rstrip("/")
 
 
 def init_command(_args: argparse.Namespace) -> None:
@@ -563,15 +578,14 @@ def attach_command(args: argparse.Namespace) -> None:
             git("worktree", "add", "-b", branch, str(destination), args.base)
         created_worktree = True
 
-    # The source SPEC is committed on the main checkout; copy it into the
-    # Epic worktree so the implementation environment has its contract.
-    worktree_specs = destination / SPECS_DIR
-    worktree_specs.mkdir(exist_ok=True)
-    shutil.copy2(path, worktree_specs / path.name)
-
     if spec["status"] == "Draft":
         set_status_in_file(path, "In-Progress")
         sync(quiet=True)
+
+    # Copy AFTER status update so the worktree copy matches the main checkout.
+    worktree_specs = destination / SPECS_DIR
+    worktree_specs.mkdir(exist_ok=True)
+    shutil.copy2(path, worktree_specs / path.name)
 
     action = "created" if created_worktree else "reused"
     print(f"{action} worktree {destination}")
@@ -590,7 +604,19 @@ def changed_files(base: str, worktree: Path | None = None) -> list[str]:
     prefix = ["-C", str(worktree)] if worktree else []
     output = git(*prefix, "diff", "--name-only", base)
     untracked = git(*prefix, "ls-files", "--others", "--exclude-standard")
-    return sorted({normalize_relative(item) for item in (output + "\n" + untracked).splitlines() if item.strip()})
+    specs_posix = normalize_relative(SPECS_DIR.as_posix())
+    sync_posix = normalize_relative(SYNC_DIR.as_posix())
+    files: set[str] = set()
+    for item in (output + "\n" + untracked).splitlines():
+        norm = normalize_relative(item)
+        if not norm:
+            continue
+        if norm == specs_posix or norm.startswith(specs_posix + "/"):
+            continue
+        if norm == sync_posix or norm.startswith(sync_posix + "/"):
+            continue
+        files.add(norm)
+    return sorted(files)
 
 
 def scope_matches(changed: str, scope: dict[str, Any]) -> tuple[bool, list[str]]:
@@ -607,7 +633,7 @@ def scope_matches(changed: str, scope: dict[str, Any]) -> tuple[bool, list[str]]
     return False, reasons
 
 
-def check_scope_command(args: argparse.Namespace) -> None:
+def check_scope_command(args: argparse.Namespace) -> int:
     specs = scan_specs()
     spec = find_spec(specs, args.spec)
     worktree: Path | None = None
@@ -647,7 +673,7 @@ def check_scope_command(args: argparse.Namespace) -> None:
             print("update the SPEC impact_scope or confirm these files are intentionally shared")
     else:
         print("All changed files match the declared impact scope.")
-    sys.exit(exit_code)
+    return exit_code
 
 
 def finish_command(args: argparse.Namespace) -> None:
@@ -925,8 +951,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     try:
         args = build_parser().parse_args()
-        args.handler(args)
-        return 0
+        result = args.handler(args)
+        return result if isinstance(result, int) else 0
     except RegistryError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

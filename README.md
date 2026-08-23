@@ -31,7 +31,7 @@ All three layers share one Python CLI, one metadata schema, one set of generated
 The three layers are connected by design:
 
 - `heartbeat --spec SPEC-001` reads `.specs/registry.json` to populate `spec_id`, `epic`, and `worktree` in the UAS payload.
-- `check-scope --spec SPEC-001` validates actual git diff against `.specs/SPEC-001.md impact_scope`.
+- `check-scope --spec SPEC-001` validates actual git diff (files/modules) against declared impact_scope. For semantic conflict detection across all four dimensions (modules, files, API endpoints, DB entities), use `check`.
 - `finish --epic order-refactor` verifies all Epic SPECs are Completed/Deprecated before destroying the worktree.
 - `heartbeats` merges all `.sync/task-*.json` into `MERGED_STATE.md` for parallel agents to read.
 
@@ -118,7 +118,7 @@ python <skill-folder>\scripts\spec_registry.py finish --epic order-refactor --ba
 | `status` | Show concise SPEC ledger | L2 |
 | `check` | Compare intended scope against existing SPECs for conflicts | L2 |
 | `attach` | Create or reuse Epic worktree; move Draft to In-Progress | L1 |
-| `check-scope` | Validate changed files against declared impact_scope | L2+L1 |
+| `check-scope` | Validate physical file/module changes against declared impact_scope | L2+L1 |
 | `finish` | Remove Epic worktree after merge and completion | L1 |
 | `worktrees` | List all Epic-to-worktree mappings | L1 |
 | `heartbeat` | Publish UAS v2.0 runtime snapshot for an active SPEC | L3 |
@@ -170,3 +170,4 @@ Previously you needed three tools:
 - Individual `SPEC-*.md` files: durable detailed source of truth.
 
 Commit `.specs/` artifacts with related implementation changes so other tasks inherit the same project state. Add `.sync/` and `.worktrees/` to `.gitignore` unless you want to persist heartbeat history.
+
