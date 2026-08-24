@@ -1,89 +1,59 @@
 #!/usr/bin/env bash
-# One-command installer for spec-registry skill (macOS/Linux).
+# spec-registry install script
+# Works from a local clone or via: curl -sSL <raw_url>/install.sh | bash
 
 set -euo pipefail
 
 SKILL_NAME="spec-registry"
-SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd)"
 
-echo ""
-echo "=== spec-registry installer ==="
-echo "source: ${SOURCE_DIR}"
-
-# Verify required files
-for f in SKILL.md scripts/spec_registry.py; do
-    if [ ! -f "${SOURCE_DIR}/${f}" ]; then
-        echo "[ERROR] missing required file: ${f}"
-        exit 1
-    fi
-done
-
-# Check Python
-echo ""
-echo "[ checking Python ]"
-PYTHON_CMD=""
-for cmd in python3 python; do
-    if command -v "$cmd" &>/dev/null && "$cmd" --version 2>&1 | grep -q "^Python 3"; then
-        PYTHON_CMD="$cmd"
-        break
-    fi
-done
-if [ -n "$PYTHON_CMD" ]; then
-    echo "  [OK] $($PYTHON_CMD --version)"
+# ── Locate install base ──────────────────────────────────────────────────────
+if [[ -n "${CLAUDE_SKILLS_DIR:-}" ]]; then
+    INSTALL_BASE="$CLAUDE_SKILLS_DIR"
+elif [[ -d "$HOME/.claude/skills" ]]; then
+    INSTALL_BASE="$HOME/.claude/skills"
+elif [[ -d "$HOME/.codex/skills" ]]; then
+    INSTALL_BASE="$HOME/.codex/skills"
 else
-    echo "  [WARN] Python 3 not found; the skill requires Python to run"
+    INSTALL_BASE="$HOME/.claude/skills"
 fi
 
-# Compile check
-if [ -n "$PYTHON_CMD" ]; then
-    echo ""
-    echo "[ compile check ]"
-    if "$PYTHON_CMD" -m py_compile "${SOURCE_DIR}/scripts/spec_registry.py" 2>/dev/null; then
-        echo "  [OK] spec_registry.py compiles"
-    else
-        echo "  [ERROR] spec_registry.py failed to compile"
-        exit 1
-    fi
+INSTALL_DIR="$INSTALL_BASE/$SKILL_NAME"
+
+# ── If running from pipe (curl | bash), clone from GitHub first ──────────────
+if [[ ! -f "$SCRIPT_DIR/SKILL.md" ]]; then
+    REPO_URL="https://github.com/wingontiger/spec-registry"
+    TMP_DIR="$(mktemp -d)"
+    echo "Cloning $SKILL_NAME from $REPO_URL ..."
+    git clone --depth 1 "$REPO_URL" "$TMP_DIR/$SKILL_NAME"
+    SCRIPT_DIR="$TMP_DIR/$SKILL_NAME"
 fi
 
-# Install targets
-echo ""
-echo "[ installing ]"
-TARGETS=(
-    "${HOME}/.codex/skills/${SKILL_NAME}"
-)
+# ── Install ──────────────────────────────────────────────────────────────────
+echo "Installing $SKILL_NAME → $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/scripts"
 
-# Add Claude Code target if its skills directory exists
-if [ -d "${HOME}/.claude/skills" ]; then
-    TARGETS+=("${HOME}/.claude/skills/${SKILL_NAME}")
-fi
+cp "$SCRIPT_DIR/SKILL.md"  "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/README.md" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/scripts/spec_registry.py" "$INSTALL_DIR/scripts/"
+cp "$SCRIPT_DIR/scripts/mcp_server.py"    "$INSTALL_DIR/scripts/"
 
-for dest in "${TARGETS[@]}"; do
-    mkdir -p "$dest"
-    cp -R "${SOURCE_DIR}/"* "$dest/"
-    # Clean pycache
-    find "$dest/scripts" -name "*.pyc" -delete 2>/dev/null || true
-    find "$dest/scripts" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-    label="unknown"
-    [[ "$dest" == *".codex"* ]] && label="Codex"
-    [[ "$dest" == *".claude"* ]] && label="Claude Code"
-    echo "  [OK] installed to ${label} -> ${dest}"
-done
-
-# MCP optional check
-echo ""
-echo "[ MCP server (optional) ]"
-if [ -n "$PYTHON_CMD" ]; then
-    if "$PYTHON_CMD" -c "import mcp" 2>/dev/null; then
-        echo "  [OK] mcp package installed; MCP server ready"
-    else
-        echo "  [INFO] for Claude Code/Cursor/Windsurf integration:"
-        echo "         pip install mcp"
-        echo "         register scripts/mcp_server.py as a stdio server"
-    fi
+# ── Verify Python ────────────────────────────────────────────────────────────
+if command -v python3 &>/dev/null; then
+    python3 -c "import ast; ast.parse(open('$INSTALL_DIR/scripts/spec_registry.py').read())" \
+        && echo "  python3 syntax OK" \
+        || echo "  WARNING: spec_registry.py syntax check failed"
+else
+    echo "  NOTE: python3 not found — install Python 3.9+ before using this skill"
 fi
 
 echo ""
-echo "=== done ==="
-echo "restart your AI tool to pick up the new skill."
+echo "✅  $SKILL_NAME installed to $INSTALL_DIR"
 echo ""
+echo "Quick start:"
+echo "  cd your-project"
+echo "  python3 \$INSTALL_DIR/scripts/spec_registry.py init"
+echo ""
+echo "MCP server (Claude Code / Cursor / Windsurf):"
+echo "  pip install mcp"
+echo "  # register $INSTALL_DIR/scripts/mcp_server.py as a stdio MCP server"

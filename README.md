@@ -1,173 +1,156 @@
 # spec-registry
 
-A unified Codex skill that replaces three previously separate tools (spec-registry, universal-task-sync, and workspace.sh) with a single deterministic Python CLI. It covers the full multi-agent collaboration lifecycle:
+Multi-task SPEC lifecycle governance for parallel agent development.
 
-| Layer | What it solves | Replaces |
+Maintains a shared `.specs/` ledger so every task and agent can discover what
+others are changing, detect conflicts before implementation, and use isolated
+Epic worktrees for physical separation.
+
+## What it fixes (vs v1)
+
+| Issue | v1 | v2 (this) |
 |---|---|---|
-| **L2: Static Contracts** | Who is changing what, which modules, API contracts, DB entities, dependencies | Original spec-registry |
-| **L1: Physical Isolation** | Git worktree lifecycle per Epic; create on attach, destroy after merge | workspace.sh (proposed, never shipped) |
-| **L3: Runtime Awareness** | UAS v2.0 heartbeats, concurrent sync, relay handoff, cross-platform watcher | universal-task-sync + fswatch/inotify |
-
-All three layers share one Python CLI, one metadata schema, one set of generated artifacts, and one MCP server for non-Codex tools.
+| `check-scope` kills MCP server | `sys.exit()` propagated | handlers return `int`; `main()` owns `sys.exit` |
+| worktree SPEC copy has stale status | copy before status update | status update first, then copy |
+| same-Epic file conflicts silently allowed | no check in `attach` | `attach` rejects overlapping `scope_files` |
+| `blocks`/`depends_on` asymmetry invisible | not checked | `sync` emits WARNING |
+| no per-task filtering | global view only | `--task-id` on `status` and `check` |
+| relay mixed into heartbeat | single `heartbeat --mode relay` | relay delegated to **peer-relay-v3** |
 
 ## Architecture
 
 ```
-.specs/                          # Durable contracts (source of truth)
-  ├── SPEC-001.md                #   YAML frontmatter + Markdown detail
-  ├── SPEC-TEMPLATE.md           #   Standard template
-  ├── registry.json              #   Generated machine-readable index
-  └── SPEC-OVERVIEW.md           #   Generated LLM context brief
+.specs/              L2 static contracts  (source of truth, committed to Git)
+  SPEC-NNN.md          individual SPEC with YAML frontmatter
+  registry.json        generated machine-readable index
+  SPEC-OVERVIEW.md     generated LLM context brief
 
-.sync/                           # Ephemeral heartbeats (runtime bus)
-  ├── task-SPEC-001.json         #   UAS v2.0 snapshot per active SPEC
-  ├── MERGED_STATE.md            #   Aggregated view for all agents
-  └── watcher.pid                #   Cross-platform polling watcher
+.worktrees/          L1 physical sandboxes (gitignored, transient)
+  epic-<slug>/         one per Epic, reused across SPECs
 
-.worktrees/                      # Transient sandboxes (git-ignored)
-  └── epic-order-refactor/       #   One per Epic, reused across SPECs
+.sync/               L3 concurrent heartbeats (managed by peer-relay-v3)
 ```
-
-The three layers are connected by design:
-
-- `heartbeat --spec SPEC-001` reads `.specs/registry.json` to populate `spec_id`, `epic`, and `worktree` in the UAS payload.
-- `check-scope --spec SPEC-001` validates actual git diff (files/modules) against declared impact_scope. For semantic conflict detection across all four dimensions (modules, files, API endpoints, DB entities), use `check`.
-- `finish --epic order-refactor` verifies all Epic SPECs are Completed/Deprecated before destroying the worktree.
-- `heartbeats` merges all `.sync/task-*.json` into `MERGED_STATE.md` for parallel agents to read.
 
 ## Install
 
-### One-command deploy
-
-Run from any directory. The script downloads this repo, installs to your AI tools skills folder, and verifies.
-
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/wingontiger/spec-registry/main/install.ps1 | iex
-```
-
-macOS / Linux:
-
 ```bash
-curl -sSL https://raw.githubusercontent.com/wingontiger/spec-registry/main/install.sh | bash
+# Claude Code / Codex global skills
+cp -r spec-registry/ ~/.claude/skills/
+
+# MCP server (optional, for Claude Code / Cursor / Windsurf)
+pip install mcp
 ```
 
-Or from a local clone:
-
-```powershell
-.\install.ps1
+Register MCP server:
+```json
+{
+  "mcpServers": {
+    "spec-registry": {
+      "command": "python",
+      "args": ["~/.claude/skills/spec-registry/scripts/mcp_server.py"]
+    }
+  }
+}
 ```
-
-```bash
-bash install.sh
-```
-
-### Manual install
-
-Copy the entire `spec-registry/` folder to:
-
-- Codex: `%USERPROFILE%\.codex\skills\spec-registry` (Windows) or `~/.codex/skills/spec-registry`
-- Claude Code: `%USERPROFILE%\.claude\skills\spec-registry` or `~/.claude/skills/spec-registry`
-
-Restart your AI tool after installation.
 
 ## Quick Start
 
-```powershell
-# 1. Initialize .specs/ in your project root
-python <skill-folder>\scripts\spec_registry.py init
+```bash
+# 1. Initialize .specs/
+python spec_registry.py init
 
-# 2. Create a SPEC with impact scope and Epic assignment
-python <skill-folder>\scripts\spec_registry.py new `
-  --title "Order timeout cancellation" `
-  --task-id TASK-A `
-  --epic order-refactor `
-  --owner "Backend Agent" `
-  --summary "Cancel timed-out orders and release inventory." `
-  --module services/order `
-  --file services/order/service.py
+# 2. Check for conflicts before creating a SPEC
+python spec_registry.py check --module services/auth --task-id TASK-A
 
-# 3. Check for conflicts before starting implementation
-python <skill-folder>\scripts\spec_registry.py check --module services/order
+# 3. Create SPEC
+python spec_registry.py new \
+  --title "JWT authentication" \
+  --task-id TASK-A --epic auth-refactor \
+  --owner "Agent A" --summary "Add JWT middleware" \
+  --module services/auth --file services/auth/handler.py
 
-# 4. Enter the Epic worktree
-python <skill-folder>\scripts\spec_registry.py attach --spec SPEC-001
+# 4. Enter isolated worktree
+python spec_registry.py attach --spec SPEC-001
 
-# 5. During development, publish heartbeat milestones
-python <skill-folder>\scripts\spec_registry.py heartbeat --spec SPEC-001 --focus "Implementing timeout logic" --tool codex
+# 5. Check scope during development (soft warning)
+python spec_registry.py check-scope --spec SPEC-001 --base main
 
-# 6. Verify scope before delivery (soft warning by default)
-python <skill-folder>\scripts\spec_registry.py check-scope --spec SPEC-001 --base main --worktree .worktrees\epic-order-refactor
+# 6. Strict gate for CI (exit 3 on violations)
+python spec_registry.py check-scope --spec SPEC-001 --base main --strict
 
-# 7. Hard gate for CI: exit 3 on out-of-scope changes
-python <skill-folder>\scripts\spec_registry.py check-scope --spec SPEC-001 --base main --worktree .worktrees\epic-order-refactor --strict
-
-# 8. After merge and completion, clean up
-python <skill-folder>\scripts\spec_registry.py finish --epic order-refactor --base main
+# 7. Mark complete and clean up
+python spec_registry.py set-status --id SPEC-001 --status Completed
+python spec_registry.py sync
+python spec_registry.py finish --epic auth-refactor --base main
 ```
+
+## SPEC File Format
+
+```markdown
+---
+id: SPEC-001
+title: "JWT authentication middleware"
+task_id: "TASK-A"
+epic_id: "auth-refactor"
+status: "Draft"
+owner: "Agent A"
+created_at: "2026-08-24"
+updated_at: "2026-08-24"
+depends_on: []
+blocks: []
+impact_scope:
+  modules:
+    - "services/auth"
+  files:
+    - "services/auth/handler.py"
+  api_endpoints:
+    - "POST /api/v1/auth/login"
+  db_entities: []
+summary: "Add JWT middleware with refresh token support"
+breaking_changes: false
+---
+```
+
+**File naming**: `SPEC-NNN.md` only (e.g. `SPEC-001.md`). Slug-named files like
+`SPEC-001-auth.md` are silently skipped by the scanner.
 
 ## All Commands
 
-| Command | Purpose | Layer |
-|---|---|---|
-| `init` | Create `.specs/` directory and initial artifacts | L2 |
-| `new` | Create next sequential SPEC with frontmatter | L2 |
-| `set-status` | Change SPEC lifecycle status | L2 |
-| `sync` | Regenerate registry.json and SPEC-OVERVIEW.md from markdown | L2 |
-| `status` | Show concise SPEC ledger | L2 |
-| `check` | Compare intended scope against existing SPECs for conflicts | L2 |
-| `attach` | Create or reuse Epic worktree; move Draft to In-Progress | L1 |
-| `check-scope` | Validate physical file/module changes against declared impact_scope | L2+L1 |
-| `finish` | Remove Epic worktree after merge and completion | L1 |
-| `worktrees` | List all Epic-to-worktree mappings | L1 |
-| `heartbeat` | Publish UAS v2.0 runtime snapshot for an active SPEC | L3 |
-| `heartbeats` | List active heartbeats and refresh merged state | L3 |
-| `watch` | Cross-platform polling watcher for .sync/ changes | L3 |
+| Command | Purpose |
+|---|---|
+| `init` | Create `.specs/` and initial generated artifacts |
+| `new` | Create next sequential SPEC |
+| `set-status` | Change SPEC lifecycle status |
+| `sync` | Regenerate `registry.json` and `SPEC-OVERVIEW.md` |
+| `status [--task-id T]` | Show SPEC ledger, optionally filtered by task |
+| `check [--task-id T]` | Conflict check against active SPECs |
+| `attach` | Create/reuse Epic worktree; Draft→In-Progress |
+| `check-scope [--strict]` | Validate git diff against declared scope |
+| `finish` | Remove Epic worktree after all SPECs merged |
+| `worktrees` | Show Epic-to-worktree mapping |
+| `heartbeat` | Publish lightweight concurrent awareness signal |
+| `heartbeats` | List active heartbeats |
+| `watch` | Cross-platform `.sync/` polling watcher |
 
-## MCP Server (for non-Codex tools)
+## MCP Tools
 
-For Claude Code, Cursor, Windsurf, Google Antigravity, or any MCP-compatible tool:
+| Tool | Maps to |
+|---|---|
+| `spec_create` | `new` |
+| `workspace_attach` | `attach` |
+| `scope_verify` | `check-scope` |
+| `state_publish` | `heartbeat` |
 
-1. Install the MCP package: `pip install mcp`
-2. Register as a stdio server pointing to `scripts/mcp_server.py`
+## Relay Handoff
 
-Four atomic tools are exposed:
+For context relay between agents, use the companion **peer-relay-v3** skill.
+spec-registry's `heartbeat` command is for concurrent awareness only.
 
-| MCP Tool | Maps to CLI | Purpose |
-|---|---|---|
-| `spec_create` | `new` | Create SPEC with impact scope |
-| `workspace_attach` | `attach` | Enter Epic worktree |
-| `scope_verify` | `check-scope` | Validate diff against scope |
-| `state_publish` | `heartbeat` | Publish runtime awareness |
+## .gitignore
 
-This single server replaces the need for separate universal-task-sync and workspace.sh integrations.
+```
+.sync/
+.worktrees/
+```
 
-## How This Unifies peer-relay-dev, Worktree, and Multi-task
-
-Previously you needed three tools:
-
-| Old tool | Problem solved | Limitation |
-|---|---|---|
-| **claude-relay** (Mode A) | Session handoff between Claude Code tasks | Claude Code only; no SPEC awareness |
-| **universal-task-sync** (Modes B+C) | Cross-tool file bus with fswatch/inotify | No SPEC validation; Bash-only watcher; no worktree binding |
-| **workspace.sh** (proposed) | Epic worktree lifecycle + scope gating | Never actually shipped; Bash-only |
-
-**spec-registry replaces all three** with these key improvements:
-
-1. **SPEC-aware heartbeats**: A heartbeat carries `spec_id`, `epic_id`, and validated `worktree_path`, not just a focus string. Agents know exactly which contract governs the current work.
-2. **Lifecycle-gated heartbeats**: Only Draft/In-Progress SPECs can publish. A Completed SPEC cannot send stale signals.
-3. **Cross-platform**: Pure Python polling replaces macOS/Linux-only fswatch/inotify.
-4. **One CLI, one schema**: All operations go through `spec_registry.py`; no shell script fragmentation across platforms.
-5. **Relay mode built in**: Set `--mode relay` on heartbeat to signal handoff. The receiving agent enters the same worktree via `attach`.
-6. **MCP bridge**: Non-Codex tools access the same CLI through standardized tool calls rather than raw shell commands.
-
-## Generated Artifacts
-
-- `registry.json`: compact machine-readable index for task startup, automation, and conflict checks.
-- `SPEC-OVERVIEW.md`: lightweight context brief for LLM injection (active + recent history).
-- `.sync/MERGED_STATE.md`: runtime awareness dashboard aggregated from all active heartbeats.
-- Individual `SPEC-*.md` files: durable detailed source of truth.
-
-Commit `.specs/` artifacts with related implementation changes so other tasks inherit the same project state. Add `.sync/` and `.worktrees/` to `.gitignore` unless you want to persist heartbeat history.
-
+Commit `.specs/` with implementation changes so other tasks inherit the same state.

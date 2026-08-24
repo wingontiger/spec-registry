@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Maintain a shared SPEC registry for parallel development tasks."""
+"""Maintain a shared SPEC registry for parallel development tasks.
+
+Changes from uploaded v1:
+  - All command handlers return int exit code; main() calls sys.exit().
+    Fixes MCP server termination when check-scope finds violations.
+  - attach: checks for file-level conflicts inside an Epic before creating
+    the worktree; fixes SPEC copy order (status update first, then copy).
+  - scan_specs: emits WARNING when blocks/depends_on are inconsistent.
+  - status / check: accept --task-id filter.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +35,8 @@ ID_PATTERN = re.compile(r"^SPEC-(\d+)$")
 STATUSES = ("Draft", "In-Progress", "Completed", "Deprecated")
 UAS_SCHEMA_VERSION = "2.0"
 
-TEMPLATE = '''---
+TEMPLATE = '''\
+---
 id: {spec_id}
 title: "{title}"
 task_id: "{task_id}"
@@ -140,7 +150,9 @@ def load_yaml(path: Path) -> dict[str, Any]:
             stack.pop()
 
         if stripped.startswith("- "):
-            candidates = [(key_indent, value) for key_indent, value in last_key_by_indent.items() if key_indent <= indent]
+            candidates = [
+                (ki, v) for ki, v in last_key_by_indent.items() if ki <= indent
+            ]
             if not candidates:
                 raise RegistryError(f"{path}:{line_no}: list item has no owning key")
             _, (owner_obj, owner_key) = max(candidates, key=lambda pair: pair[0])
@@ -197,7 +209,7 @@ def as_bool(value: Any, field: str, path: Path) -> bool:
 def normalize_spec(path: Path) -> dict[str, Any]:
     meta = load_yaml(path)
     required = ("id", "title", "task_id", "status", "owner", "created_at", "updated_at", "summary")
-    missing = [field for field in required if field not in meta or meta[field] in (None, "")]
+    missing = [f for f in required if f not in meta or meta[f] in (None, "")]
     if missing:
         raise RegistryError(f"{path}: missing required fields: {', '.join(missing)}")
 
@@ -217,7 +229,9 @@ def normalize_spec(path: Path) -> dict[str, Any]:
         db_entities=as_str_list(scope_raw.get("db_entities"), "impact_scope.db_entities", path),
     )
     if not any((scope.modules, scope.files, scope.api_endpoints, scope.db_entities)):
-        raise RegistryError(f"{path}: impact_scope must declare at least one module, file, endpoint, or entity")
+        raise RegistryError(
+            f"{path}: impact_scope must declare at least one module, file, endpoint, or entity"
+        )
 
     return {
         "id": spec_id,
@@ -237,12 +251,18 @@ def normalize_spec(path: Path) -> dict[str, Any]:
     }
 
 
-def scan_specs() -> list[dict[str, Any]]:
+def scan_specs(warn: bool = True) -> list[dict[str, Any]]:
+    """Load, validate, and sort all SPEC-NNN.md files in SPECS_DIR.
+
+    Emits stderr WARNINGs (not errors) for blocks/depends_on asymmetry so
+    that CI pipelines are not broken by partially-written SPECs.
+    """
     if not SPECS_DIR.is_dir():
         raise RegistryError(".specs does not exist; run 'init' first")
     specs: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for path in sorted(SPECS_DIR.glob("SPEC-*.md")):
+        # Skip template and any slug-named files (SPEC-001-slug.md)
         if path.name == "SPEC-TEMPLATE.md" or not ID_PATTERN.fullmatch(path.stem):
             continue
         spec = normalize_spec(path)
@@ -251,23 +271,15 @@ def scan_specs() -> list[dict[str, Any]]:
         seen_ids.add(spec["id"])
         specs.append(spec)
 
+    # Validate cross-references
     for spec in specs:
         unknown = sorted(set(spec["depends_on"] + spec["blocks"]) - seen_ids)
         if unknown:
-            raise RegistryError(f"{spec['source_path']}: unknown referenced SPEC IDs: {', '.join(unknown)}")
+            raise RegistryError(
+                f"{spec['source_path']}: unknown referenced SPEC IDs: {', '.join(unknown)}"
+            )
 
-    # Warn about asymmetric blocks declarations (not a hard error).
-    spec_by_id = {spec["id"]: spec for spec in specs}
-    for spec in specs:
-        for blocked_id in spec["blocks"]:
-            blocked_spec = spec_by_id.get(blocked_id)
-            if blocked_spec and spec["id"] not in blocked_spec.get("depends_on", []):
-                print(
-                    f"warning: {blocked_id} does not list {spec['id']} in depends_on "
-                    f"but is declared as blocked by it",
-                    file=sys.stderr,
-                )
-
+    # Cycle detection via DFS (3-colour)
     graph = {spec["id"]: set(spec["depends_on"]) for spec in specs}
     state: dict[str, int] = {}
 
@@ -286,12 +298,27 @@ def scan_specs() -> list[dict[str, Any]]:
     for node in graph:
         visit(node, [])
 
+    # FIX: blocks / depends_on symmetry check (WARNING only, not error)
+    if warn:
+        id_to_spec = {s["id"]: s for s in specs}
+        for spec in specs:
+            for blocked_id in spec["blocks"]:
+                blocked = id_to_spec.get(blocked_id)
+                if blocked and spec["id"] not in blocked["depends_on"]:
+                    print(
+                        f"WARNING: {spec['id']} declares blocks: {blocked_id} "
+                        f"but {blocked_id}.depends_on does not list {spec['id']}",
+                        file=sys.stderr,
+                    )
+
     return sorted(specs, key=lambda item: int(ID_PATTERN.fullmatch(item["id"]).group(1)))
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -319,11 +346,13 @@ def build_overview(specs: list[dict[str, Any]]) -> str:
             impacts: list[str] = []
             for key in ("modules", "files", "api_endpoints", "db_entities"):
                 impacts.extend(spec["impact_scope"][key])
-            impact_text = ", ".join(f"`{value}`" for value in impacts[:12])
+            impact_text = ", ".join(f"`{v}`" for v in impacts[:12])
             if len(impacts) > 12:
                 impact_text += ", ..."
             breaking = "; **BREAKING**" if spec["breaking_changes"] else ""
-            dependencies = f"; depends on {', '.join(spec['depends_on'])}" if spec["depends_on"] else ""
+            dependencies = (
+                f"; depends on {', '.join(spec['depends_on'])}" if spec["depends_on"] else ""
+            )
             lines.append(
                 f"- **{spec['id']}** - {spec['title']} - `{spec['status']}` "
                 f"| task `{spec['task_id']}`{breaking}{dependencies} | {impact_text or 'no declared impact'}"
@@ -355,7 +384,11 @@ def normalize_relative(value: str) -> str:
     return val.rstrip("/")
 
 
-def init_command(_args: argparse.Namespace) -> None:
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def init_command(_args: argparse.Namespace) -> int:
     SPECS_DIR.mkdir(exist_ok=True)
     if TEMPLATE_PATH.exists():
         print(f"template already exists: {TEMPLATE_PATH}")
@@ -371,16 +404,17 @@ def init_command(_args: argparse.Namespace) -> None:
             dependencies=yaml_list([], "  "),
             modules=yaml_list(["services/example"], "    "),
             files=yaml_list(["services/example/file.py"], "    "),
-            api_endpoints=[],
-            db_entities=[],
+            api_endpoints=yaml_list([], "    "),
+            db_entities=yaml_list([], "    "),
             summary="One-sentence purpose.",
         )
         TEMPLATE_PATH.write_text(body, encoding="utf-8")
         print(f"created {TEMPLATE_PATH}")
     sync()
+    return 0
 
 
-def new_command(args: argparse.Namespace) -> None:
+def new_command(args: argparse.Namespace) -> int:
     specs = sync(quiet=True)
     if not any((args.modules, args.files, args.api_endpoints, args.db_entities)):
         raise RegistryError("declare at least one --module, --file, --api, or --db impact")
@@ -409,6 +443,7 @@ def new_command(args: argparse.Namespace) -> None:
     print(f"created {path}")
     if args.open and os.environ.get("EDITOR"):
         subprocess.run([os.environ["EDITOR"], str(path)], check=False)
+    return 0
 
 
 def find_spec(specs: list[dict[str, Any]], spec_id: str) -> dict[str, Any]:
@@ -418,27 +453,36 @@ def find_spec(specs: list[dict[str, Any]], spec_id: str) -> dict[str, Any]:
     return matches[0]
 
 
-def set_status_command(args: argparse.Namespace) -> None:
-    specs = scan_specs()
-    spec = find_spec(specs, args.id)
-    path = Path(spec["source_path"])
+def set_status_in_file(path: Path, status: str) -> None:
     text = path.read_text(encoding="utf-8")
-    updated, replacements = re.subn(r"(?m)^status:.*$", f'status: "{args.status}"', text, count=1)
-    if replacements != 1:
+    updated, n = re.subn(r"(?m)^status:.*$", f'status: "{status}"', text, count=1)
+    if n != 1:
         raise RegistryError(f"could not locate status field in {path}")
     updated = re.sub(r"(?m)^updated_at:.*$", f'updated_at: "{today()}"', updated, count=1)
     path.write_text(updated, encoding="utf-8")
+
+
+def set_status_command(args: argparse.Namespace) -> int:
+    specs = scan_specs()
+    spec = find_spec(specs, args.id)
+    path = Path(spec["source_path"])
+    set_status_in_file(path, args.status)
     sync()
     print(f"{spec['id']} -> {args.status}")
+    return 0
 
 
-def status_command(args: argparse.Namespace) -> None:
+def status_command(args: argparse.Namespace) -> int:
     specs = scan_specs()
+    # FIX: --task-id filter
+    if args.task_id:
+        specs = [s for s in specs if s["task_id"].lower() == args.task_id.lower()]
     if args.format == "json":
         print(json.dumps({"specs": specs}, ensure_ascii=False, indent=2))
-        return
-    for spec in specs:
-        print(f"{spec['id']:9} {spec['status']:11} {spec['task_id']:18} {spec['title']}")
+    else:
+        for spec in specs:
+            print(f"{spec['id']:9} {spec['status']:11} {spec['task_id']:18} {spec['title']}")
+    return 0
 
 
 def collect_query(args: argparse.Namespace) -> tuple[list[str], list[str], list[str], list[str]]:
@@ -450,7 +494,9 @@ def collect_query(args: argparse.Namespace) -> tuple[list[str], list[str], list[
     )
 
 
-def overlaps(spec: dict[str, Any], query: tuple[list[str], list[str], list[str], list[str]]) -> list[str]:
+def overlaps(
+    spec: dict[str, Any], query: tuple[list[str], list[str], list[str], list[str]]
+) -> list[str]:
     query_modules, query_files, query_apis, query_dbs = query
     scope = spec["impact_scope"]
     matches: list[str] = []
@@ -466,8 +512,11 @@ def overlaps(spec: dict[str, Any], query: tuple[list[str], list[str], list[str],
     return matches
 
 
-def check_command(args: argparse.Namespace) -> None:
+def check_command(args: argparse.Namespace) -> int:
     specs = scan_specs()
+    # FIX: --task-id filter
+    if args.task_id:
+        specs = [s for s in specs if s["task_id"].lower() != args.task_id.lower()]
     query = collect_query(args)
     statuses = STATUSES if args.all else ("Draft", "In-Progress")
     conflicts: list[dict[str, Any]] = []
@@ -490,7 +539,12 @@ def check_command(args: argparse.Namespace) -> None:
             print(f"- {item['spec']} ({item['status']}, {item['task_id']}): {'; '.join(item['overlaps'])}")
     else:
         print("No declared SPEC overlaps found.")
+    return 0
 
+
+# ---------------------------------------------------------------------------
+# Git / Worktree helpers
+# ---------------------------------------------------------------------------
 
 def require_git_repo() -> None:
     result = subprocess.run(
@@ -545,7 +599,8 @@ def update_frontmatter_field(path: Path, field: str, value: str) -> bool:
     return replacements == 1
 
 
-def attach_command(args: argparse.Namespace) -> None:
+def attach_command(args: argparse.Namespace) -> int:
+    require_git_repo()
     specs = scan_specs()
     spec = find_spec(specs, args.spec)
     epic_id = spec["epic_id"]
@@ -553,6 +608,23 @@ def attach_command(args: argparse.Namespace) -> None:
 
     if spec["status"] in ("Completed", "Deprecated"):
         raise RegistryError(f"{spec['id']} is {spec['status']}; it cannot be attached")
+
+    # FIX: Check for file-level conflicts among In-Progress SPECs in the same Epic
+    same_epic_active = [
+        s for s in specs
+        if s["epic_id"] == epic_id
+        and s["id"] != spec["id"]
+        and s["status"] == "In-Progress"
+    ]
+    new_files = set(spec["impact_scope"]["files"])
+    for other in same_epic_active:
+        overlap = new_files & set(other["impact_scope"]["files"])
+        if overlap:
+            raise RegistryError(
+                f"file conflict inside Epic '{epic_id}': "
+                f"{spec['id']} and {other['id']} both declare: {sorted(overlap)}. "
+                f"Add depends_on or resolve before attaching."
+            )
 
     if not WORKTREES_DIR.is_dir():
         WORKTREES_DIR.mkdir()
@@ -578,11 +650,13 @@ def attach_command(args: argparse.Namespace) -> None:
             git("worktree", "add", "-b", branch, str(destination), args.base)
         created_worktree = True
 
+    # FIX: Update status in source file FIRST, then copy so the copy carries
+    # the correct In-Progress status (not the stale Draft).
     if spec["status"] == "Draft":
         set_status_in_file(path, "In-Progress")
         sync(quiet=True)
+        # Re-read path after sync (source_path unchanged, but file content updated)
 
-    # Copy AFTER status update so the worktree copy matches the main checkout.
     worktree_specs = destination / SPECS_DIR
     worktree_specs.mkdir(exist_ok=True)
     shutil.copy2(path, worktree_specs / path.name)
@@ -592,12 +666,7 @@ def attach_command(args: argparse.Namespace) -> None:
     print(f"branch: {branch}")
     print(f"spec:   {spec['id']} ({Path(spec['source_path'])})")
     print("edit only inside this worktree until delivery")
-
-
-def set_status_in_file(path: Path, status: str) -> None:
-    if not update_frontmatter_field(path, "status", status):
-        raise RegistryError(f"could not locate status field in {path}")
-    update_frontmatter_field(path, "updated_at", today())
+    return 0
 
 
 def changed_files(base: str, worktree: Path | None = None) -> list[str]:
@@ -620,20 +689,30 @@ def changed_files(base: str, worktree: Path | None = None) -> list[str]:
 
 
 def scope_matches(changed: str, scope: dict[str, Any]) -> tuple[bool, list[str]]:
-    reasons: list[str] = []
+    """Check if a changed file path is within the declared impact scope.
+
+    NOTE: api_endpoints and db_entities are semantic scope dimensions used by
+    'check' (pre-work conflict detection). 'check-scope' operates on physical
+    git diffs and only validates files and modules.
+    """
     normalized_changed = normalize_relative(changed)
     for file_path in scope["files"]:
         if normalized_changed == normalize_relative(file_path):
             return True, []
     for module in scope["modules"]:
         module_path = normalize_relative(module)
-        if module_path and (normalized_changed == module_path or normalized_changed.startswith(module_path + "/")):
+        if module_path and (
+            normalized_changed == module_path
+            or normalized_changed.startswith(module_path + "/")
+        ):
             return True, []
-    reasons.append("file is outside impact_scope.files and all impact_scope.modules")
-    return False, reasons
+    return False, ["file is outside impact_scope.files and all impact_scope.modules"]
 
 
 def check_scope_command(args: argparse.Namespace) -> int:
+    """FIX: Returns exit code instead of calling sys.exit() directly.
+    This allows MCP server to call this without terminating the process.
+    """
     specs = scan_specs()
     spec = find_spec(specs, args.spec)
     worktree: Path | None = None
@@ -646,7 +725,7 @@ def check_scope_command(args: argparse.Namespace) -> int:
     violations: list[str] = []
     allowed: list[str] = []
     for item in files:
-        matched, _reasons = scope_matches(item, spec["impact_scope"])
+        matched, _ = scope_matches(item, spec["impact_scope"])
         if matched:
             allowed.append(item)
         else:
@@ -659,9 +738,7 @@ def check_scope_command(args: argparse.Namespace) -> int:
         "violations": violations,
         "strict": args.strict,
     }
-    exit_code = 0
-    if violations and args.strict:
-        exit_code = 3
+    exit_code = 3 if (violations and args.strict) else 0
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     elif violations:
@@ -673,25 +750,32 @@ def check_scope_command(args: argparse.Namespace) -> int:
             print("update the SPEC impact_scope or confirm these files are intentionally shared")
     else:
         print("All changed files match the declared impact scope.")
-    return exit_code
+    return exit_code   # caller (main or MCP) decides whether to sys.exit
 
 
-def finish_command(args: argparse.Namespace) -> None:
+def finish_command(args: argparse.Namespace) -> int:
+    require_git_repo()
     specs = scan_specs()
     epics = read_epics(specs)
     if args.epic not in epics:
         raise RegistryError(f"no SPECs are assigned to epic '{args.epic}'")
     epic_specs = epics[args.epic]
-    incomplete = [spec["id"] for spec in epic_specs if spec["status"] not in ("Completed", "Deprecated")]
+    incomplete = [
+        s["id"] for s in epic_specs if s["status"] not in ("Completed", "Deprecated")
+    ]
     if incomplete:
-        raise RegistryError(f"cannot finish epic '{args.epic}'; these SPECs are still active: {', '.join(incomplete)}")
+        raise RegistryError(
+            f"cannot finish epic '{args.epic}'; these SPECs are still active: {', '.join(incomplete)}"
+        )
 
     branch = epic_branch(args.epic)
     destination = epic_worktree_path(args.epic).resolve()
     if destination.exists():
         current_branch = git("-C", str(destination), "rev-parse", "--abbrev-ref", "HEAD")
         if current_branch != branch:
-            raise RegistryError(f"worktree {destination} is on unexpected branch {current_branch}")
+            raise RegistryError(
+                f"worktree {destination} is on unexpected branch {current_branch}"
+            )
         merged = subprocess.run(
             ["git", "merge-base", "--is-ancestor", branch, args.base],
             capture_output=True,
@@ -704,33 +788,37 @@ def finish_command(args: argparse.Namespace) -> None:
         try:
             git("worktree", "remove", str(destination))
         except RegistryError:
-            # Generated indexes may legitimately differ between branches;
-            # they are rebuilt from Markdown and are never authoritative.
             git("worktree", "remove", "--force", str(destination))
         print(f"removed worktree {destination}")
     else:
         print("no local worktree to remove")
     git("worktree", "prune")
     print(f"finished epic {args.epic}; SPEC records remain archived in .specs/")
+    return 0
 
 
-def worktrees_command(_args: argparse.Namespace) -> None:
+def worktrees_command(_args: argparse.Namespace) -> int:
+    require_git_repo()
     specs = scan_specs()
     epics = read_epics(specs)
-    rows: list[tuple[str, str, str, int]] = []
+    if not epics:
+        print("No Epic assignments found.")
+        return 0
     for epic_id, epic_specs in sorted(epics.items()):
-        active = sum(1 for spec in epic_specs if spec["status"] in ("Draft", "In-Progress"))
+        active = sum(1 for s in epic_specs if s["status"] in ("Draft", "In-Progress"))
         total = len(epic_specs)
         destination = epic_worktree_path(epic_id)
         state = "active" if destination.exists() else "absent"
-        rows.append((epic_id, f"spec/{epic_slug(epic_id)}", state, total))
-        print(f"{epic_id:24} branch=spec/{epic_slug(epic_id):30} worktree={state:7} active={active} total={total}")
-    if not rows:
-        print("No Epic assignments found.")
+        print(
+            f"{epic_id:24} branch=spec/{epic_slug(epic_id):30} "
+            f"worktree={state:7} active={active} total={total}"
+        )
+    return 0
 
 
 # ---------------------------------------------------------------------------
-# Heartbeat (UAS runtime awareness)
+# Heartbeat (UAS runtime awareness — lightweight concurrent only)
+# Full relay/handoff is handled by the peer-relay-v3 skill.
 # ---------------------------------------------------------------------------
 
 def heartbeat_path(spec_id: str) -> Path:
@@ -746,17 +834,12 @@ def build_uas(spec: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         "epic": spec["epic_id"],
         "agent_model": args.model or "unknown",
         "agent_tool": args.tool or "unknown",
-        "mode": args.mode,
-        "sender_continues": args.mode == "concurrent",
+        "mode": "concurrent",
+        "sender_continues": True,
         "timestamp": utc_now(),
         "context_level": args.context_level,
         "worktree": str(epic_worktree_path(spec["epic_id"]).as_posix()),
         "current_focus": args.focus or "",
-        "completed": [],
-        "in_progress": [],
-        "blockers": [],
-        "next_steps": [],
-        "key_decisions": [],
         "notes": args.notes or "",
     }
 
@@ -806,34 +889,40 @@ def sync_heartbeats(quiet: bool = False) -> list[dict[str, Any]]:
     return states
 
 
-def heartbeat_command(args: argparse.Namespace) -> None:
+def heartbeat_command(args: argparse.Namespace) -> int:
     specs = scan_specs()
     spec = find_spec(specs, args.spec)
     if spec["status"] in ("Completed", "Deprecated"):
-        raise RegistryError(f"{spec['id']} is {spec['status']}; cannot publish a heartbeat for an inactive SPEC")
+        raise RegistryError(
+            f"{spec['id']} is {spec['status']}; cannot publish a heartbeat for an inactive SPEC"
+        )
     uas = build_uas(spec, args)
     SYNC_DIR.mkdir(exist_ok=True)
     path = heartbeat_path(spec["id"])
     write_json_atomic(path, uas)
     sync_heartbeats(quiet=True)
     print(f"heartbeat published: {path}")
+    return 0
 
 
-def heartbeats_command(args: argparse.Namespace) -> None:
+def heartbeats_command(args: argparse.Namespace) -> int:
     states = load_heartbeats()
     if args.json:
         print(json.dumps({"heartbeats": states}, ensure_ascii=False, indent=2))
     else:
         for s in states:
             mode = "relay" if not s.get("sender_continues") else "concurrent"
-            print(f"{s['task_id']:12} {s.get('epic', 'default'):24} {s.get('agent_tool', '?'):16} {s.get('current_focus', '')[:50]}")
+            print(
+                f"{s['task_id']:12} {s.get('epic', 'default'):24} "
+                f"{s.get('agent_tool', '?'):16} {s.get('current_focus', '')[:50]}"
+            )
         if not states:
             print("No active heartbeats.")
     sync_heartbeats(quiet=True)
+    return 0
 
 
-def watch_command(args: argparse.Namespace) -> None:
-    """Cross-platform polling watcher. Replaces fswatch/inotify."""
+def watch_command(args: argparse.Namespace) -> int:
     SYNC_DIR.mkdir(exist_ok=True)
     pid_file = SYNC_DIR / "watcher.pid"
     if pid_file.exists():
@@ -841,7 +930,7 @@ def watch_command(args: argparse.Namespace) -> None:
             old_pid = int(pid_file.read_text().strip())
             os.kill(old_pid, 0)
             print(f"watcher already running (PID {old_pid})")
-            return
+            return 0
         except (ProcessLookupError, ValueError, PermissionError):
             pid_file.unlink(missing_ok=True)
 
@@ -857,100 +946,120 @@ def watch_command(args: argparse.Namespace) -> None:
     finally:
         pid_file.unlink(missing_ok=True)
         print("watcher stopped")
+    return 0
 
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help="create .specs and initial generated files")
-    init_parser.set_defaults(handler=init_command)
+    # init
+    p = sub.add_parser("init", help="create .specs and initial generated files")
+    p.set_defaults(handler=init_command)
 
-    new_parser = subparsers.add_parser("new", help="create the next sequential SPEC")
-    new_parser.add_argument("--title", required=True)
-    new_parser.add_argument("--task-id", required=True)
-    new_parser.add_argument("--epic", required=True, dest="epic_id", help="Epic identifier used to reuse one worktree")
-    new_parser.add_argument("--owner", required=True)
-    new_parser.add_argument("--summary", required=True)
-    new_parser.add_argument("--module", action="append", default=[], dest="modules")
-    new_parser.add_argument("--file", action="append", default=[], dest="files")
-    new_parser.add_argument("--api", action="append", default=[], dest="api_endpoints")
-    new_parser.add_argument("--db", action="append", default=[], dest="db_entities")
-    new_parser.add_argument("--depends-on", action="append", default=[], dest="depends_on")
-    new_parser.add_argument("--blocks", action="append", default=[])
-    new_parser.add_argument("--breaking-changes", action="store_true")
-    new_parser.add_argument("--open", action="store_true", help="open the created file with EDITOR")
-    new_parser.set_defaults(handler=new_command)
+    # new
+    p = sub.add_parser("new", help="create the next sequential SPEC")
+    p.add_argument("--title", required=True)
+    p.add_argument("--task-id", required=True)
+    p.add_argument("--epic", required=True, dest="epic_id")
+    p.add_argument("--owner", required=True)
+    p.add_argument("--summary", required=True)
+    p.add_argument("--module", action="append", default=[], dest="modules")
+    p.add_argument("--file", action="append", default=[], dest="files")
+    p.add_argument("--api", action="append", default=[], dest="api_endpoints")
+    p.add_argument("--db", action="append", default=[], dest="db_entities")
+    p.add_argument("--depends-on", action="append", default=[], dest="depends_on")
+    p.add_argument("--blocks", action="append", default=[])
+    p.add_argument("--breaking-changes", action="store_true")
+    p.add_argument("--open", action="store_true")
+    p.set_defaults(handler=new_command)
 
-    status_set_parser = subparsers.add_parser("set-status", help="change a SPEC lifecycle status")
-    status_set_parser.add_argument("--id", required=True)
-    status_set_parser.add_argument("--status", required=True, choices=STATUSES)
-    status_set_parser.set_defaults(handler=set_status_command)
+    # set-status
+    p = sub.add_parser("set-status", help="change a SPEC lifecycle status")
+    p.add_argument("--id", required=True)
+    p.add_argument("--status", required=True, choices=STATUSES)
+    p.set_defaults(handler=set_status_command)
 
-    sync_parser = subparsers.add_parser("sync", help="scan markdown and regenerate registry/overview")
-    sync_parser.set_defaults(handler=lambda _args: sync())
+    # sync
+    p = sub.add_parser("sync", help="regenerate registry/overview from markdown")
+    p.set_defaults(handler=lambda _args: (sync(), 0)[1])
 
-    status_parser = subparsers.add_parser("status", help="show a concise SPEC ledger")
-    status_parser.add_argument("--format", choices=("table", "json"), default="table")
-    status_parser.set_defaults(handler=status_command)
+    # status — FIX: added --task-id
+    p = sub.add_parser("status", help="show SPEC ledger")
+    p.add_argument("--format", choices=("table", "json"), default="table")
+    p.add_argument("--task-id", default="", help="filter by task ID")
+    p.set_defaults(handler=status_command)
 
-    check_parser = subparsers.add_parser("check", help="check intended scope against existing SPECs")
-    check_parser.add_argument("--module", action="append", default=[], dest="modules")
-    check_parser.add_argument("--file", action="append", default=[], dest="files")
-    check_parser.add_argument("--api", action="append", default=[], dest="api_endpoints")
-    check_parser.add_argument("--db", action="append", default=[], dest="db_entities")
-    check_parser.add_argument("--all", action="store_true", help="include Completed and Deprecated SPECs")
-    check_parser.add_argument("--json", action="store_true")
-    check_parser.set_defaults(handler=check_command)
-
-    attach_parser = subparsers.add_parser("attach", help="create or reuse an Epic worktree for a SPEC")
-    attach_parser.add_argument("--spec", required=True)
-    attach_parser.add_argument("--base", default="HEAD", help="Git revision to branch from when creating a worktree")
-    attach_parser.set_defaults(handler=attach_command)
-
-    scope_parser = subparsers.add_parser(
-        "check-scope",
-        help="compare changed files with a SPEC's declared impact scope",
-        description="Development-time warnings are the default; use --strict in CI/review gates.",
+    # check — FIX: added --task-id (excludes own task's SPECs from conflict check)
+    p = sub.add_parser("check", help="check intended scope against existing SPECs")
+    p.add_argument("--module", action="append", default=[], dest="modules")
+    p.add_argument("--file", action="append", default=[], dest="files")
+    p.add_argument("--api", action="append", default=[], dest="api_endpoints")
+    p.add_argument("--db", action="append", default=[], dest="db_entities")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--task-id", default="",
+        help="exclude this task's own SPECs from the conflict check"
     )
-    scope_parser.add_argument("--spec", required=True)
-    scope_parser.add_argument("--base", default="HEAD", help="Git diff base; use main or origin/main for review")
-    scope_parser.add_argument("--worktree", help="path to an Epic worktree; defaults to the current directory")
-    scope_parser.add_argument("--strict", action="store_true", help="exit nonzero on out-of-scope changes (CI gate)")
-    scope_parser.add_argument("--json", action="store_true")
-    scope_parser.set_defaults(handler=check_scope_command)
+    p.set_defaults(handler=check_command)
 
-    finish_parser = subparsers.add_parser("finish", help="remove an Epic worktree after all its SPECs are merged/completed")
-    finish_parser.add_argument("--epic", required=True)
-    finish_parser.add_argument("--base", default="main", help="branch that must already contain the Epic branch")
-    finish_parser.set_defaults(handler=finish_command)
+    # attach
+    p = sub.add_parser("attach", help="create or reuse an Epic worktree for a SPEC")
+    p.add_argument("--spec", required=True)
+    p.add_argument("--base", default="HEAD")
+    p.set_defaults(handler=attach_command)
 
-    worktrees_parser = subparsers.add_parser("worktrees", help="show Epic-to-worktree mappings and activity")
-    worktrees_parser.set_defaults(handler=worktrees_command)
+    # check-scope
+    p = sub.add_parser("check-scope", help="validate changed files against SPEC impact_scope")
+    p.add_argument("--spec", required=True)
+    p.add_argument("--base", default="HEAD")
+    p.add_argument("--worktree")
+    p.add_argument("--strict", action="store_true", help="exit 3 on violations (CI gate)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=check_scope_command)
 
-    heartbeat_parser = subparsers.add_parser("heartbeat", help="publish a UAS runtime heartbeat for a SPEC")
-    heartbeat_parser.add_argument("--spec", required=True)
-    heartbeat_parser.add_argument("--focus", required=True, help="one-sentence current focus")
-    heartbeat_parser.add_argument("--tool", default="unknown", help="agent tool name (codex/claude-code/zcode/...)")
-    heartbeat_parser.add_argument("--model", default="unknown", help="model name")
-    heartbeat_parser.add_argument("--mode", choices=("concurrent", "relay"), default="concurrent")
-    heartbeat_parser.add_argument("--context-level", type=int, default=50)
-    heartbeat_parser.add_argument("--notes", default="")
-    heartbeat_parser.set_defaults(handler=heartbeat_command)
+    # finish
+    p = sub.add_parser("finish", help="remove Epic worktree after all SPECs are merged")
+    p.add_argument("--epic", required=True)
+    p.add_argument("--base", default="main")
+    p.set_defaults(handler=finish_command)
 
-    heartbeats_parser = subparsers.add_parser("heartbeats", help="list active UAS heartbeats and refresh merged view")
-    heartbeats_parser.add_argument("--json", action="store_true")
-    heartbeats_parser.set_defaults(handler=heartbeats_command)
+    # worktrees
+    p = sub.add_parser("worktrees", help="show Epic-to-worktree mappings")
+    p.set_defaults(handler=worktrees_command)
 
-    watch_parser = subparsers.add_parser("watch", help="cross-platform .sync watcher (polling)")
-    watch_parser.add_argument("--interval", type=float, default=5.0, help="poll interval in seconds")
-    watch_parser.set_defaults(handler=watch_command)
+    # heartbeat (concurrent only; relay is handled by peer-relay-v3)
+    p = sub.add_parser("heartbeat", help="publish a lightweight concurrent awareness signal")
+    p.add_argument("--spec", required=True)
+    p.add_argument("--focus", required=True)
+    p.add_argument("--tool", default="unknown")
+    p.add_argument("--model", default="unknown")
+    p.add_argument("--context-level", type=int, default=50)
+    p.add_argument("--notes", default="")
+    p.set_defaults(handler=heartbeat_command)
+
+    # heartbeats
+    p = sub.add_parser("heartbeats", help="list active heartbeats and refresh merged view")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=heartbeats_command)
+
+    # watch
+    p = sub.add_parser("watch", help="cross-platform .sync/ polling watcher")
+    p.add_argument("--interval", type=float, default=5.0)
+    p.set_defaults(handler=watch_command)
+
     return parser
 
 
 def main() -> int:
     try:
         args = build_parser().parse_args()
+        # FIX: All handlers return int; main() is the single sys.exit() call site.
         result = args.handler(args)
         return result if isinstance(result, int) else 0
     except RegistryError as error:

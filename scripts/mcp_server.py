@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Minimal MCP server exposing spec-registry operations to non-Codex tools.
+"""MCP server exposing spec-registry operations to Claude Code, Cursor, Windsurf.
 
-Uses the Model Context Protocol stdio transport. Install with:
-    pip install mcp
+Install:  pip install mcp
+Register as a stdio MCP server pointing to this file.
 
-Register with Claude Code / Cursor / Windsurf as a stdio server:
-    python <skill-folder>/scripts/mcp_server.py
+Exposes four tools:
+    spec_create       new SPEC with impact scope
+    workspace_attach  enter Epic worktree
+    scope_verify      validate changed files against declared scope
+    state_publish     publish concurrent heartbeat
 
-Exposes four tools matching the Gemini proposal:
-    spec_create, workspace_attach, scope_verify, state_publish
+FIX: scope_verify now uses _call_cli (unified code path) because
+check_scope_command returns an int exit code instead of calling sys.exit().
+The old direct sr.*() calls that bypassed the CLI are removed.
 """
 
 from __future__ import annotations
 
-import argparse
+import io
 import json
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from mcp.server import Server
@@ -24,12 +29,13 @@ from mcp.types import TextContent, Tool
 
 # Import the CLI module by path so the server works from any cwd.
 import importlib.util
+
 _cli_path = str(Path(__file__).parent / "spec_registry.py")
 _spec = importlib.util.spec_from_file_location("spec_registry", _cli_path)
 sr = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sr)
 
-app = Server("spec-registry-harness")
+app = Server("spec-registry")
 
 
 @app.list_tools()
@@ -37,59 +43,80 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="spec_create",
-            description="Create the next sequential SPEC with impact scope and epic assignment.",
+            description=(
+                "Create the next sequential SPEC with impact scope and epic assignment. "
+                "Automatically assigns the next sequential ID and refreshes registry.json."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
+                    "title":   {"type": "string"},
                     "task_id": {"type": "string"},
-                    "epic": {"type": "string"},
-                    "owner": {"type": "string"},
+                    "epic":    {"type": "string"},
+                    "owner":   {"type": "string"},
                     "summary": {"type": "string"},
-                    "modules": {"type": "array", "items": {"type": "string"}},
-                    "files": {"type": "array", "items": {"type": "string"}},
+                    "modules": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "files":   {"type": "array", "items": {"type": "string"}, "default": []},
+                    "api_endpoints": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "db_entities":   {"type": "array", "items": {"type": "string"}, "default": []},
+                    "depends_on":    {"type": "array", "items": {"type": "string"}, "default": []},
+                    "breaking_changes": {"type": "boolean", "default": False},
                 },
                 "required": ["title", "task_id", "epic", "owner", "summary"],
             },
         ),
         Tool(
             name="workspace_attach",
-            description="Create or reuse an Epic worktree for the given SPEC and move it to In-Progress.",
+            description=(
+                "Create or reuse the Epic worktree for a given SPEC and move it from Draft "
+                "to In-Progress. Verifies there are no file-level conflicts inside the Epic "
+                "before creating the worktree."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "spec_id": {"type": "string"},
-                    "base": {"type": "string", "default": "HEAD"},
+                    "base":    {"type": "string", "default": "HEAD"},
                 },
                 "required": ["spec_id"],
             },
         ),
         Tool(
             name="scope_verify",
-            description="Check changed files against SPEC impact_scope. Returns violations; strict mode blocks.",
+            description=(
+                "Check files changed in the current worktree against the SPEC impact_scope. "
+                "Returns allowed and violation lists. strict=true causes 'blocked: true' and "
+                "is suitable for CI gating. "
+                "Note: api_endpoints and db_entities are semantic scope only; "
+                "this tool validates physical files and modules."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "spec_id": {"type": "string"},
-                    "base": {"type": "string", "default": "HEAD"},
+                    "spec_id":  {"type": "string"},
+                    "base":     {"type": "string", "default": "HEAD"},
                     "worktree": {"type": "string"},
-                    "strict": {"type": "boolean", "default": False},
+                    "strict":   {"type": "boolean", "default": False},
                 },
                 "required": ["spec_id"],
             },
         ),
         Tool(
             name="state_publish",
-            description="Publish a UAS heartbeat for an active SPEC.",
+            description=(
+                "Publish a lightweight concurrent heartbeat for an active SPEC. "
+                "For relay handoff (richer context transfer), use the peer-relay-v3 skill's "
+                "'handoff' command instead."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "spec_id": {"type": "string"},
-                    "focus": {"type": "string"},
-                    "tool": {"type": "string", "default": "unknown"},
-                    "model": {"type": "string", "default": "unknown"},
-                    "mode": {"type": "string", "enum": ["concurrent", "relay"], "default": "concurrent"},
+                    "spec_id":       {"type": "string"},
+                    "focus":         {"type": "string"},
+                    "tool":          {"type": "string", "default": "unknown"},
+                    "model":         {"type": "string", "default": "unknown"},
                     "context_level": {"type": "integer", "default": 50},
+                    "notes":         {"type": "string", "default": ""},
                 },
                 "required": ["spec_id", "focus"],
             },
@@ -101,26 +128,33 @@ class MCPRegistryError(Exception):
     """Wrap RegistryError for JSON-RPC error responses."""
 
 
-def _call_cli(args_list: list[str]) -> dict:
-    """Run spec_registry.py main() in-process and capture output."""
-    import io
-    from contextlib import redirect_stdout, redirect_stderr
-    import os
+def _call_cli(args_list: list[str]) -> tuple[int, str, str]:
+    """Run spec_registry main() in-process; return (exit_code, stdout, stderr).
 
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-    old_argv = sys.argv[1:]
+    FIX: Captures SystemExit (including from check-scope violations in strict
+    mode) instead of letting it propagate and kill the MCP server process.
+    """
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    old_argv = sys.argv[:]
+    exit_code = 0
     try:
-        sys.argv[1:] = args_list
-        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            code = sr.main()
-        if code != 0:
-            raise MCPRegistryError(stderr_capture.getvalue().strip())
-        return {"success": True, "output": stdout_capture.getvalue().strip()}
-    except sr.RegistryError as e:
-        raise MCPRegistryError(str(e)) from None
+        sys.argv = ["spec_registry.py", *args_list]
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            exit_code = sr.main()
+    except SystemExit as exc:
+        exit_code = int(exc.code) if exc.code is not None else 0
     finally:
-        sys.argv[1:] = old_argv
+        sys.argv = old_argv
+    return exit_code, stdout_buf.getvalue().strip(), stderr_buf.getvalue().strip()
+
+
+def _ok(output: str, **extra) -> list[TextContent]:
+    return [TextContent(type="text", text=json.dumps({"success": True, "output": output, **extra}))]
+
+
+def _err(message: str) -> list[TextContent]:
+    return [TextContent(type="text", text=json.dumps({"success": False, "error": message}))]
 
 
 @app.call_tool()
@@ -129,70 +163,81 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "spec_create":
             args = [
                 "new",
-                "--title", arguments["title"],
+                "--title",   arguments["title"],
                 "--task-id", arguments["task_id"],
-                "--epic", arguments["epic"],
-                "--owner", arguments["owner"],
+                "--epic",    arguments["epic"],
+                "--owner",   arguments["owner"],
                 "--summary", arguments["summary"],
             ]
-            for mod in arguments.get("modules", []):
-                args.extend(["--module", mod])
+            for m in arguments.get("modules", []):
+                args += ["--module", m]
             for f in arguments.get("files", []):
-                args.extend(["--file", f])
-            result = _call_cli(args)
+                args += ["--file", f]
+            for a in arguments.get("api_endpoints", []):
+                args += ["--api", a]
+            for d in arguments.get("db_entities", []):
+                args += ["--db", d]
+            for dep in arguments.get("depends_on", []):
+                args += ["--depends-on", dep]
+            if arguments.get("breaking_changes"):
+                args.append("--breaking-changes")
+            code, out, err = _call_cli(args)
+            if code != 0:
+                return _err(err or out)
+            return _ok(out)
 
         elif name == "workspace_attach":
             args = ["attach", "--spec", arguments["spec_id"]]
             if arguments.get("base"):
-                args.extend(["--base", arguments["base"]])
-            result = _call_cli(args)
+                args += ["--base", arguments["base"]]
+            code, out, err = _call_cli(args)
+            if code != 0:
+                return _err(err or out)
+            return _ok(out)
 
         elif name == "scope_verify":
-            args = ["check-scope", "--spec", arguments["spec_id"]]
+            # FIX: Now uses _call_cli uniformly. check_scope_command returns exit
+            # code 3 on strict violations (not sys.exit), so it no longer kills
+            # the MCP server process.
+            args = ["check-scope", "--spec", arguments["spec_id"], "--json"]
             if arguments.get("base"):
-                args.extend(["--base", arguments["base"]])
+                args += ["--base", arguments["base"]]
             if arguments.get("worktree"):
-                args.extend(["--worktree", arguments["worktree"]])
+                args += ["--worktree", arguments["worktree"]]
             if arguments.get("strict"):
                 args.append("--strict")
-            args.append("--json")
-            # check-scope exits nonzero on violations in strict mode;
-            # we need the JSON regardless, so call scan directly.
-            specs = sr.scan_specs()
-            spec = sr.find_spec(specs, arguments["spec_id"])
-            base = arguments.get("base") or "HEAD"
-            wt = Path(arguments["worktree"]).resolve() if arguments.get("worktree") else None
-            files = sr.changed_files(base, wt)
-            violations = [f for f in files if not sr.scope_matches(f, spec["impact_scope"])[0]]
-            allowed = [f for f in files if sr.scope_matches(f, spec["impact_scope"])[0]]
-            blocked = bool(violations) and bool(arguments.get("strict"))
-            result = {
-                "success": not blocked,
-                "spec": spec["id"],
-                "changed_files": files,
-                "allowed": allowed,
-                "violations": violations,
-                "blocked": blocked,
-            }
+            code, out, err = _call_cli(args)
+            # exit code 3 = violations in strict mode (expected, not a crash)
+            # exit code 2 = RegistryError (SPEC not found, etc.)
+            if code == 2:
+                return _err(err or out)
+            try:
+                payload = json.loads(out)
+            except json.JSONDecodeError:
+                payload = {"raw_output": out}
+            payload["blocked"] = (code == 3)
+            return [TextContent(type="text", text=json.dumps({"success": True, **payload}))]
 
         elif name == "state_publish":
             args = [
                 "heartbeat",
-                "--spec", arguments["spec_id"],
-                "--focus", arguments["focus"],
-                "--tool", arguments.get("tool", "unknown"),
-                "--model", arguments.get("model", "unknown"),
-                "--mode", arguments.get("mode", "concurrent"),
+                "--spec",          arguments["spec_id"],
+                "--focus",         arguments["focus"],
+                "--tool",          arguments.get("tool", "unknown"),
+                "--model",         arguments.get("model", "unknown"),
                 "--context-level", str(arguments.get("context_level", 50)),
+                "--notes",         arguments.get("notes", ""),
             ]
-            result = _call_cli(args)
+            code, out, err = _call_cli(args)
+            if code != 0:
+                return _err(err or out)
+            return _ok(out)
 
         else:
-            raise MCPRegistryError(f"unknown tool: {name}")
+            return _err(f"unknown tool: {name}")
 
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
-    except MCPRegistryError as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
 
 
 async def run() -> None:
