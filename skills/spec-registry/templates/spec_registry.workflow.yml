@@ -1,0 +1,29 @@
+name: spec-registry
+on:
+  pull_request:
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 治理索引校验(存在时)
+        run: |
+          if [ -f registry/spec_registry.json ]; then
+            python scripts/spec-registry/ci/spec_registry.py validate --root . --registry registry/spec_registry.json
+          else
+            echo "没有 registry/spec_registry.json, 跳过"
+          fi
+      - name: 孤儿分支检查
+        run: |
+          B="${GITHUB_HEAD_REF}"
+          case "$B" in
+            epic/*)
+              E="${B#epic/}"
+              grep -Eq "^epic: \"?${E}\"?[[:space:]]*(#.*)?$" .specs/*.md 2>/dev/null \
+                || { echo "分支 $B 没有对应 Epic 的 SPEC"; exit 1; }
+              ;;
+          esac
+# 人类审批必须靠受保护分支和 CODEOWNERS, 仅靠 JSON 里的字段不构成授权。

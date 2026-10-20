@@ -1,0 +1,6 @@
+# spec-registry managed begin
+.specs/** text eol=lf
+registry/*.json text eol=lf
+scripts/spec-registry/** text eol=lf
+scripts/spec-registry/*.cmd text eol=crlf
+# spec-registry managed end

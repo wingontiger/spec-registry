@@ -1,0 +1,4 @@
+# 示例: 治理索引与 SPEC 只能由指定的人审批(需要在 GitHub 里同时开启受保护分支 + Require review from Code Owners)
+/registry/spec_registry.json   @your-github-id
+/.specs/                       @your-github-id
+/scripts/spec-registry/        @your-github-id
