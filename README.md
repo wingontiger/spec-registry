@@ -150,3 +150,7 @@ bash skills/spec-registry/scripts/smoke-test.sh     # 61 项检查,在临时仓�
 ```
 
 要求:Python 3、pyyaml、git。
+
+## License
+
+[MIT](LICENSE)。
